@@ -4,12 +4,16 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.attention.layer import Attention
+from vllm.config import (CompilationLevel, VllmConfig,
+                         get_layers_from_vllm_config, set_current_vllm_config)
+
 from vllm.forward_context import set_forward_context
-from vllm.model_executor.model_loader.loader import get_model_loader
+from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 from vllm.model_executor.models.deepseek_mtp import DeepSeekMTP
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
 
 # FIXME(woosuk): The logic here is duplicated with the main sampling code.
@@ -148,12 +152,21 @@ class MtpProposer:
         #     input_batch=self.runner.input_batch,
         #     scheduler_output=self.runner.scheduler_output,
         # )
+        num_reqs = self.runner.input_batch.num_reqs
+
+        query_start_loc = self.runner.query_start_loc[:num_reqs + 1]
+        seq_lens = self.runner.seq_lens[:num_reqs]
+
+        common_attn_metadata = CommonAttentionMetadata(
+            query_start_loc=query_start_locm seq_lens=seq_lens
+        )
 
         attn_metadata = self.runner.attn_metadata_builder.build(
             num_reqs=batch_size,
             num_actual_tokens=num_tokens,
             max_query_len=max_query_len,
             common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata
         )
 
         with set_forward_context(attn_metadata, self.vllm_config):
@@ -173,6 +186,10 @@ class MtpProposer:
     def load_model(self, target_model: nn.Module) -> None:
         loader = get_model_loader(self.vllm_config.load_config)
 
+        traget_attn_layer_names = set(
+            get_layers_from_vllm_config(self.vllm_config, Attention).keys()
+        )
+
         draft_model_config = \
             self.vllm_config.speculative_config.draft_model_config
         # FIXME(lily): This does not handle with distributed inference.
@@ -184,6 +201,14 @@ class MtpProposer:
                     self.vllm_config):
             self.model = DeepSeekMTP(
                 vllm_config=self.vllm_config).to(target_device)
+            
+        draft_attn_layer_names = (
+            get_layers_from_vllm_config(self.vllm_config, Attention).keys() -
+            traget_attn_layer_names
+        )
+
+        assert len(draft_attn_layer_names) == 1
+        self.attn_layer_name = next(iter(draft_attn_layer_names))
 
         self.model.load_weights(
             loader.get_all_weights(
